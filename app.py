@@ -38,6 +38,7 @@ def get_answer():
     query_text = data.get('query')
     session_val = data.get('session')
     preamble = data.get('preamble')
+    filter_str = data.get('filter')
     reasoning_engine_id = data.get('reasoning_engine')
 
     if not query_text:
@@ -152,8 +153,15 @@ def get_answer():
         "query": {"text": query_text},
         "session": session_name,
         #"relatedQuestionsSpec": {"enable": False},
-        "answerGenerationSpec": answer_gen_spec
+        "answerGenerationSpec": answer_gen_spec,
     }
+
+    if filter_str:
+        payload["searchSpec"] = {
+            "searchParams": {
+                "filter": filter_str
+            }
+        }
 
     try:
         start_time = time.time()
@@ -186,10 +194,166 @@ def get_answer():
         
         return jsonify(output)
 
+
     except requests.exceptions.RequestException as e:
         error_msg = str(e)
         if e.response is not None:
              error_msg = e.response.text
+        return jsonify({"error": f"API request failed: {error_msg}"}), 500
+
+@app.route('/answer2', methods=['POST'])
+def get_answer2():
+    """
+    Endpoint using StreamAssist (streamAnswer) to get answers.
+    Ignores Reasoning Engine logic.
+    """
+    data = request.json
+    query_text = data.get('query')
+    session_val = data.get('session')
+    preamble = data.get('preamble')
+    # reasoning_engine_id ignored for this endpoint
+
+    if not query_text:
+        return jsonify({"error": "Query is required"}), 400
+
+    access_token = AuthService.get_access_token()
+    if not access_token:
+        return jsonify({"error": "Failed to authenticate"}), 500
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+
+    # DISCOVERY ENGINE LOGIC (StreamAnswer)
+    session_name = session_val
+    project_id = Config.PROJECT_ID
+    location = Config.LOCATION
+    collection_id = Config.COLLECTION_ID
+    engine_id = Config.ENGINE_ID
+    serving_config_id = Config.SERVING_CONFIG_ID
+    
+    if not session_name:
+        try:
+            session_api_url = f"https://discoveryengine.googleapis.com/v1/projects/{project_id}/locations/{location}/collections/{collection_id}/engines/{engine_id}/sessions"
+            session_payload = {"userPseudoId": "test-user"}
+            session_resp = requests.post(session_api_url, headers=headers, json=session_payload)
+            if session_resp.status_code == 200:
+                session_name = session_resp.json().get("name")
+            else:
+                print(f"Failed to create session: {session_resp.text}")
+        except Exception as e:
+            print(f"Session creation exception: {e}")
+    
+    # Use v1beta for streamAnswer as it is often the available version for streaming methods in REST
+    # Note: 'StreamAssist' often refers to the streamAnswer capability.
+    api_url = f"https://discoveryengine.googleapis.com/v1beta/projects/{project_id}/locations/{location}/collections/{collection_id}/engines/{engine_id}/servingConfigs/{serving_config_id}:streamAnswer"
+    
+    answer_gen_spec = {
+        "includeCitations": True,
+        "answerLanguageCode": "en"
+    }
+    if preamble:
+        answer_gen_spec["promptSpec"] = {"preamble": preamble}
+
+    payload = {
+        "query": {"text": query_text},
+        "session": session_name,
+        #"relatedQuestionsSpec": {"enable": False},
+        "answerGenerationSpec": answer_gen_spec
+    }
+
+    try:
+        start_time = time.time()
+        # Stream=True for streaming response
+        response = requests.post(api_url, headers=headers, json=payload, stream=True)
+        # We don't verify status code immediately here as it might be streaming error 
+        if response.status_code >= 400:
+             # Try to read error content
+             error_content = response.text
+             return jsonify({"error": f"StreamAnswer request failed: {error_content}"}), response.status_code
+
+        accumulated_text = ""
+        final_answer_data = {}
+        
+        # Parse full response payload
+        # We wait for the complete payload as per requirements to handle potential framing issues
+        full_response_text = response.text
+        
+        decoder = json.JSONDecoder()
+        pos = 0
+        while pos < len(full_response_text):
+            # Skip whitespace
+            while pos < len(full_response_text) and full_response_text[pos].isspace():
+                pos += 1
+            if pos >= len(full_response_text):
+                break
+                
+            try:
+                chunk_data, end = decoder.raw_decode(full_response_text, idx=pos)
+                pos = end
+                
+                # Handle potential list if API returns a JSON array
+                items = [chunk_data] if isinstance(chunk_data, dict) else chunk_data
+                if not isinstance(items, list):
+                    continue
+
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+
+                    if "answer" in item:
+                        ans_obj = item["answer"]
+                        text_chunk = ans_obj.get("answerText", "")
+                        
+                        if text_chunk:
+                            accumulated_text = text_chunk
+                        
+                        if "citations" in ans_obj:
+                            final_answer_data["citations"] = ans_obj["citations"]
+                        if "references" in ans_obj:
+                            final_answer_data["references"] = ans_obj["references"]
+                        if "relatedQuestions" in ans_obj:
+                            final_answer_data["relatedQuestions"] = ans_obj["relatedQuestions"]
+
+                    if "session" in item:
+                         final_answer_data["session"] = item["session"]
+            
+            except json.JSONDecodeError:
+                print(f"Failed to decode JSON chunk at pos {pos}")
+                break
+
+        elapsed_time = time.time() - start_time
+        print(f"Discovery Engine StreamAnswer API call took: {elapsed_time:.4f} seconds")
+
+        # Fallback if no text
+        if not accumulated_text:
+             accumulated_text = "No answer found."
+
+        # Session name normalization
+        session_val_resp = final_answer_data.get("session")
+        session_name_out = None
+        if isinstance(session_val_resp, dict):
+             session_name_out = session_val_resp.get("name")
+        else:
+             session_name_out = session_val_resp
+             
+        # If session not in response, use the input session_name
+        if not session_name_out:
+             session_name_out = session_name
+
+        output = {
+            "answer": accumulated_text,
+            "citations": final_answer_data.get("citations", []),
+            "references": final_answer_data.get("references", []),
+            "session": session_name_out,
+            "related_questions": final_answer_data.get("relatedQuestions", [])
+        }
+        
+        return jsonify(output)
+
+    except requests.exceptions.RequestException as e:
+        error_msg = str(e)
         return jsonify({"error": f"API request failed: {error_msg}"}), 500
 
 
